@@ -9,6 +9,11 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
 
+try:
+    import libsql_client
+except ImportError:
+    libsql_client = None
+
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +27,92 @@ logger = logging.getLogger("Luffy-Gateway")
 
 app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None)
 
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+
+user_daily_traffic: dict = defaultdict(lambda: defaultdict(int))
+
+async def get_db():
+    if not libsql_client or not TURSO_URL:
+        return None
+    try:
+        return libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+    except Exception as e:
+        logger.error(f"Failed to connect to Turso: {e}")
+        return None
+
+async def save_to_db():
+    db = await get_db()
+    if not db:
+        return
+    try:
+        async with LINKS_LOCK:
+            for uid, data in LINKS.items():
+                db.execute("INSERT OR REPLACE INTO links (uid, data) VALUES (?, ?)", (uid, json.dumps(data)))
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for uid, dates in user_daily_traffic.items():
+            if today in dates:
+                db.execute("INSERT OR REPLACE INTO daily_usage (uid, date, bytes) VALUES (?, ?, ?)", (uid, today, dates[today]))
+
+        db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("stats", json.dumps(stats)))
+        db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("hourly_traffic", json.dumps(dict(hourly_traffic))))
+        db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("daily_traffic", json.dumps(dict(daily_traffic))))
+        async with CUSTOM_ADDRESSES_LOCK:
+            db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("custom_addresses", json.dumps(CUSTOM_ADDRESSES)))
+    except Exception as e:
+        logger.error(f"Database save error: {e}")
+    finally:
+        db.close()
+
+async def load_from_db():
+    db = await get_db()
+    if not db:
+        return
+    try:
+        rs = db.execute("SELECT uid, data FROM links")
+        async with LINKS_LOCK:
+            for row in rs.rows:
+                LINKS[row[0]] = json.loads(row[1])
+
+        rs = db.execute("SELECT uid, date, bytes FROM daily_usage")
+        for row in rs.rows:
+            user_daily_traffic[row[0]][row[1]] = row[2]
+
+        rs = db.execute("SELECT key, value FROM global_stats")
+        for row in rs.rows:
+            key, val = row[0], json.loads(row[1])
+            if key == "stats": stats.update(val)
+            elif key == "hourly_traffic": hourly_traffic.update(val)
+            elif key == "daily_traffic": daily_traffic.update(val)
+            elif key == "custom_addresses":
+                async with CUSTOM_ADDRESSES_LOCK:
+                    CUSTOM_ADDRESSES.clear()
+                    CUSTOM_ADDRESSES.extend(val)
+    except Exception as e:
+        logger.error(f"Database load error: {e}")
+    finally:
+        db.close()
+
+async def init_db():
+    db = await get_db()
+    if not db:
+        return
+    try:
+        db.execute("CREATE TABLE IF NOT EXISTS links (uid TEXT PRIMARY KEY, data TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS daily_usage (uid TEXT, date TEXT, bytes INTEGER, PRIMARY KEY (uid, date))")
+        db.execute("CREATE TABLE IF NOT EXISTS global_stats (key TEXT PRIMARY KEY, value TEXT)")
+        await load_from_db()
+    except Exception as e:
+        logger.error(f"Database init error: {e}")
+    finally:
+        db.close()
+
+async def autosave_task():
+    while True:
+        await asyncio.sleep(300)
+        await save_to_db()
+
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
@@ -31,7 +122,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 # ── در-حافظه ────────────────────────────────────────────────────────────────
 connections: dict = {}
-connections_lock = asyncio.Lock()          # FIX: lock برای connections
+connections_lock = asyncio.Lock()
 connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
@@ -48,8 +139,6 @@ CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 UNLIMITED_QUOTA_BYTES = 53687091200000
-
-# ── Auth ─────────────────────────────────────────────────────────────────────
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
@@ -98,7 +187,9 @@ async def keep_alive():
 
 @app.on_event("startup")
 async def startup():
+    await init_db()
     global http_client
+    asyncio.create_task(autosave_task())
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
@@ -331,6 +422,15 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "expires_at": expires_at, "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}"),
     }
 
+@app.get("/api/usage/{uid}")
+async def get_user_usage(uid: str, _=Depends(require_auth)):
+    usage = user_daily_traffic.get(uid, {})
+    # Return last 7 days
+    result = {}
+    for i in range(7):
+        d = (datetime.now(timezone.utc) - timedelta(days=i)).strftime("%Y-%m-%d")
+        result[d] = usage.get(d, 0)
+    return result
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     result = []
@@ -543,6 +643,8 @@ async def add_usage(uid: str, n: int):
     async with LINKS_LOCK:
         if uid in LINKS:
             LINKS[uid]["used_bytes"] += n
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            user_daily_traffic[uid][today] += n
 
 # FIX: drain داخل try/except اضافه شد و writer بررسی می‌شه
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
@@ -1011,6 +1113,10 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </button>
       <button class="nav-item" data-page="addresses">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+      <button class="nav-item" data-page="usage">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20v-6M6 20V10M18 20V4"/></svg>
+        <span class="nav-label" data-en="Usage" data-fa="مصرف">Usage</span>
+      </button>
         <span class="nav-label" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
       </button>
       <button class="nav-item" data-page="security">
@@ -1114,6 +1220,15 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     </section>
 
     <!-- Traffic -->
+    <!-- Usage -->
+    <section class="page" id="page-usage">
+      <div class="page-header"><div><div class="page-title" data-en="Usage" data-fa="مصرف">Usage</div><div class="page-sub" data-en="Per-user daily usage" data-fa="مصرف روزانه کاربر">Per-user daily usage</div></div></div>
+      <div class="card">
+        <div class="fg"><label class="fl" data-en="Select Inbound" data-fa="انتخاب اینباند">Select Inbound</label>
+        <select class="fs" id="u-sel" onchange="loadUserUsage()"><option value="">Select...</option></select></div>
+        <div class="chart-container" style="margin-top:20px"><canvas id="uc"></canvas></div>
+      </div>
+    </section>
     <section class="page" id="page-traffic">
       <div class="page-header"><div><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="page-sub" data-en="Statistics" data-fa="آمار">Statistics</div></div></div>
       <div class="card">
@@ -1220,6 +1335,7 @@ let theme=localStorage.getItem('theme')||'dark';
 let allLinks=[];
 let cf='all';
 let sData={};
+let uChart=null;
 let tChart=null;
 let allAddrs=[];
 let isAuthenticated=false;
@@ -1625,6 +1741,7 @@ async function loadLinks(){
     if(!r.ok)throw new Error();
     const d=await r.json();
     allLinks=d.links||[];
+    const sel=$m("u-sel"); if(sel){ const cur=sel.value; sel.innerHTML="<option value=''>Select...</option>"+allLinks.map(l=>`<option value="${l.uuid}">${l.label}</option>`).join(""); sel.value=cur; }
     filterLinks();
   }catch(e){/* silent */}
 }
@@ -1650,6 +1767,47 @@ async function chgPw(){
 }
 
 // ── Chart ─────────────────────────────────────────────────────────────────────
+async function loadUserUsage(){
+  const uid=$m("u-sel").value;
+  if(!uid){ if(uChart){ uChart.data.labels=[]; uChart.data.datasets[0].data=[]; uChart.update(); } return; }
+  try{
+    const r = await fetch("/api/usage/"+uid);
+    if(!r.ok) throw new Error();
+    const d = await r.json();
+    if(!uChart) initUserChart();
+    const entries = Object.entries(d).sort((a,b)=>a[0].localeCompare(b[0]));
+    uChart.data.labels = entries.map(x=>x[0].split("-").slice(1).join("/"));
+    uChart.data.datasets[0].data = entries.map(x=>Math.round(x[1]/1048576));
+    uChart.update();
+  }catch(e){console.error(e);}
+}
+
+function initUserChart(){
+  const ctx=$m("uc");
+  if(!ctx||uChart)return;
+  uChart=new Chart(ctx,{
+    type:"bar",
+    data:{
+      labels:[],
+      datasets:[{label:"MB",data:[],backgroundColor:"rgba(255,215,0,0.55)",borderColor:"#FFD700",borderWidth:1,borderRadius:4}]
+    },
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{
+        x:{grid:{display:false},ticks:{color:"rgba(255,215,0,0.3)",font:{size:10}}},
+        y:{grid:{color:"rgba(255,255,255,0.04)"},ticks:{color:"rgba(255,215,0,0.3)",font:{size:10},callback:v=>v+" MB"},beginAtZero:true}
+      }
+    }
+  });
+  const col=theme==="light"?"rgba(0,0,0,0.5)":"rgba(255,215,0,0.4)";
+  const gridCol=theme==="light"?"rgba(0,0,0,0.08)":"rgba(255,255,255,0.06)";
+  uChart.options.scales.x.ticks.color=col;
+  uChart.options.scales.y.ticks.color=col;
+  uChart.options.scales.y.grid.color=gridCol;
+  uChart.update();
+}
+
 function initChart(){
   const ctx=$m('tc');
   if(!ctx||tChart)return;
@@ -1672,6 +1830,14 @@ function initChart(){
 }
 
 function updChartColors(){
+  if(uChart){
+    const col=theme==="light"?"rgba(0,0,0,0.5)":"rgba(255,215,0,0.4)";
+    const gridCol=theme==="light"?"rgba(0,0,0,0.08)":"rgba(255,255,255,0.06)";
+    uChart.options.scales.x.ticks.color=col;
+    uChart.options.scales.y.ticks.color=col;
+    uChart.options.scales.y.grid.color=gridCol;
+    uChart.update();
+  }
   if(!tChart)return;
   const col=theme==='light'?'rgba(0,0,0,0.5)':'rgba(255,215,0,0.4)';
   const gridCol=theme==='light'?'rgba(0,0,0,0.08)':'rgba(255,255,255,0.06)';
