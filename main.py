@@ -36,77 +36,78 @@ async def get_db():
     if not libsql_client or not TURSO_URL:
         return None
     try:
-        return libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+        # If URL starts with wss:// or libsql://, some environments prefer https:// for firewall reasons
+        url = TURSO_URL
+        if url.startswith("libsql://"):
+            url = url.replace("libsql://", "https://")
+        return libsql_client.create_client(url=url, auth_token=TURSO_AUTH_TOKEN)
     except Exception as e:
         logger.error(f"Failed to connect to Turso: {e}")
         return None
 
 async def save_to_db():
-    db = await get_db()
-    if not db:
+    client = await get_db()
+    if not client:
         return
     try:
-        async with LINKS_LOCK:
-            for uid, data in LINKS.items():
-                db.execute("INSERT OR REPLACE INTO links (uid, data) VALUES (?, ?)", (uid, json.dumps(data)))
+        async with client as db:
+            async with LINKS_LOCK:
+                for uid, data in LINKS.items():
+                    await db.execute("INSERT OR REPLACE INTO links (uid, data) VALUES (?, ?)", (uid, json.dumps(data)))
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        for uid, dates in user_daily_traffic.items():
-            if today in dates:
-                db.execute("INSERT OR REPLACE INTO daily_usage (uid, date, bytes) VALUES (?, ?, ?)", (uid, today, dates[today]))
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            for uid, dates in user_daily_traffic.items():
+                if today in dates:
+                    await db.execute("INSERT OR REPLACE INTO daily_usage (uid, date, bytes) VALUES (?, ?, ?)", (uid, today, dates[today]))
 
-        db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("stats", json.dumps(stats)))
-        db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("hourly_traffic", json.dumps(dict(hourly_traffic))))
-        db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("daily_traffic", json.dumps(dict(daily_traffic))))
-        async with CUSTOM_ADDRESSES_LOCK:
-            db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("custom_addresses", json.dumps(CUSTOM_ADDRESSES)))
+            await db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("stats", json.dumps(stats)))
+            await db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("hourly_traffic", json.dumps(dict(hourly_traffic))))
+            await db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("daily_traffic", json.dumps(dict(daily_traffic))))
+            async with CUSTOM_ADDRESSES_LOCK:
+                await db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, ?)", ("custom_addresses", json.dumps(CUSTOM_ADDRESSES)))
     except Exception as e:
         logger.error(f"Database save error: {e}")
-    finally:
-        db.close()
 
 async def load_from_db():
-    db = await get_db()
-    if not db:
+    client = await get_db()
+    if not client:
         return
     try:
-        rs = db.execute("SELECT uid, data FROM links")
-        async with LINKS_LOCK:
+        async with client as db:
+            rs = await db.execute("SELECT uid, data FROM links")
+            async with LINKS_LOCK:
+                for row in rs.rows:
+                    LINKS[row[0]] = json.loads(row[1])
+
+            rs = await db.execute("SELECT uid, date, bytes FROM daily_usage")
             for row in rs.rows:
-                LINKS[row[0]] = json.loads(row[1])
+                user_daily_traffic[row[0]][row[1]] = row[2]
 
-        rs = db.execute("SELECT uid, date, bytes FROM daily_usage")
-        for row in rs.rows:
-            user_daily_traffic[row[0]][row[1]] = row[2]
-
-        rs = db.execute("SELECT key, value FROM global_stats")
-        for row in rs.rows:
-            key, val = row[0], json.loads(row[1])
-            if key == "stats": stats.update(val)
-            elif key == "hourly_traffic": hourly_traffic.update(val)
-            elif key == "daily_traffic": daily_traffic.update(val)
-            elif key == "custom_addresses":
-                async with CUSTOM_ADDRESSES_LOCK:
-                    CUSTOM_ADDRESSES.clear()
-                    CUSTOM_ADDRESSES.extend(val)
+            rs = await db.execute("SELECT key, value FROM global_stats")
+            for row in rs.rows:
+                key, val = row[0], json.loads(row[1])
+                if key == "stats": stats.update(val)
+                elif key == "hourly_traffic": hourly_traffic.update(val)
+                elif key == "daily_traffic": daily_traffic.update(val)
+                elif key == "custom_addresses":
+                    async with CUSTOM_ADDRESSES_LOCK:
+                        CUSTOM_ADDRESSES.clear()
+                        CUSTOM_ADDRESSES.extend(val)
     except Exception as e:
         logger.error(f"Database load error: {e}")
-    finally:
-        db.close()
 
 async def init_db():
-    db = await get_db()
-    if not db:
+    client = await get_db()
+    if not client:
         return
     try:
-        db.execute("CREATE TABLE IF NOT EXISTS links (uid TEXT PRIMARY KEY, data TEXT)")
-        db.execute("CREATE TABLE IF NOT EXISTS daily_usage (uid TEXT, date TEXT, bytes INTEGER, PRIMARY KEY (uid, date))")
-        db.execute("CREATE TABLE IF NOT EXISTS global_stats (key TEXT PRIMARY KEY, value TEXT)")
+        async with client as db:
+            await db.execute("CREATE TABLE IF NOT EXISTS links (uid TEXT PRIMARY KEY, data TEXT)")
+            await db.execute("CREATE TABLE IF NOT EXISTS daily_usage (uid TEXT, date TEXT, bytes INTEGER, PRIMARY KEY (uid, date))")
+            await db.execute("CREATE TABLE IF NOT EXISTS global_stats (key TEXT PRIMARY KEY, value TEXT)")
         await load_from_db()
     except Exception as e:
         logger.error(f"Database init error: {e}")
-    finally:
-        db.close()
 
 async def autosave_task():
     while True:
