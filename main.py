@@ -1114,10 +1114,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </button>
       <button class="nav-item" data-page="addresses">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
-      <button class="nav-item" data-page="usage">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20v-6M6 20V10M18 20V4"/></svg>
-        <span class="nav-label" data-en="Usage" data-fa="مصرف">Usage</span>
-      </button>
         <span class="nav-label" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
       </button>
       <button class="nav-item" data-page="security">
@@ -1221,21 +1217,20 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     </section>
 
     <!-- Traffic -->
-    <!-- Usage -->
-    <section class="page" id="page-usage">
-      <div class="page-header"><div><div class="page-title" data-en="Usage" data-fa="مصرف">Usage</div><div class="page-sub" data-en="Per-user daily usage" data-fa="مصرف روزانه کاربر">Per-user daily usage</div></div></div>
-      <div class="card">
-        <div class="fg"><label class="fl" data-en="Select Inbound" data-fa="انتخاب اینباند">Select Inbound</label>
-        <select class="fs" id="u-sel" onchange="loadUserUsage()"><option value="">Select...</option></select></div>
-        <div class="chart-container" style="margin-top:20px"><canvas id="uc"></canvas></div>
-      </div>
-    </section>
+
     <section class="page" id="page-traffic">
       <div class="page-header"><div><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="page-sub" data-en="Statistics" data-fa="آمار">Statistics</div></div></div>
       <div class="card">
         <div class="sl-item"><span class="sl-k" data-en="Total Traffic" data-fa="کل ترافیک">Total Traffic</span><span class="sl-v" id="t-tr">–</span></div>
         <div class="sl-item"><span class="sl-k" data-en="Total Requests" data-fa="کل درخواست‌ها">Total Requests</span><span class="sl-v" id="t-rq">–</span></div>
         <div class="sl-item"><span class="sl-k" data-en="Uptime" data-fa="آپتایم">Uptime</span><span class="sl-v" id="t-up">–</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-hd"><div class="card-title" data-en="Per-user Usage" data-fa="مصرف هر کاربر">Per-user Usage</div></div>
+        <div class="fg"><label class="fl" data-en="Select Inbound" data-fa="انتخاب اینباند">Select Inbound</label>
+        <select class="fs" id="u-sel" onchange="loadUserUsage()"><option value="">Select...</option></select></div>
+        <div class="chart-container" style="margin-top:20px"><canvas id="uc"></canvas></div>
       </div>
     </section>
 
