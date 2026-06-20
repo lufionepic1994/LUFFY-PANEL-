@@ -127,6 +127,34 @@ Panel will be available at: `http://localhost:8000/login`
 
 ---
 
+
+---
+
+## 🗄️ Persistent Database (Turso)
+
+Luffy Panel supports persistent storage using [Turso](https://turso.tech). If configured, your users, traffic data, and daily usage statistics will be saved every 5 minutes and persisted across restarts.
+
+### How to set up Turso on Render:
+
+1. **Create a Turso Database**:
+   * Sign up at [Turso.tech](https://turso.tech).
+   * Create a new database (e.g., `luffy-db`).
+   * Get your **Database URL** (starts with `libsql://`).
+   * Generate an **Auth Token**.
+
+2. **Configure Environment Variables on Render**:
+   * Go to your Render Dashboard → Select your service.
+   * Go to **Environment**.
+   * Add the following variables:
+     * `TURSO_DATABASE_URL`: Your Turso connection URL.
+     * `TURSO_AUTH_TOKEN`: Your Turso authentication token.
+
+3. **Redeploy**:
+   * Render will automatically redeploy or you can manually trigger a deploy.
+   * The panel will now automatically create tables and start persisting data.
+
+> 💡 **Note:** If these variables are not set, the panel will fall back to **in-memory storage** (data will be lost on restart).
+
 ## ⚙️ Environment Variables
 
 | Variable | Description | Default |
@@ -231,8 +259,8 @@ vless://<uuid>@<domain>:443?encryption=none&security=tls&type=ws&host=<domain>&p
 
 ## ⚠️ Notes
 
-- All data is stored **in-memory**. Restarting the service resets all inbounds and traffic stats.
-- For persistent storage, a database backend (e.g. SQLite) would need to be added.
+- All data is stored **in-memory** by default. Restarting the service resets all inbounds and traffic stats.
+- **Persistent storage** is supported via Turso (see the Database section above).
 - The keep-alive task pings `/health` every 10 minutes to prevent Render free-tier spin-down.
 
 ---
@@ -389,6 +417,32 @@ python main.py
 
 ---
 
+
+---
+
+## 🗄️ دیتابیس دائمی (Turso)
+
+لوفی پنل از ذخیره‌سازی دائمی با استفاده از [Turso](https://turso.tech) پشتیبانی می‌کند. در صورت تنظیم، کاربران، داده‌های ترافیک و آمار مصرف روزانه هر ۵ دقیقه ذخیره شده و با ریستارت شدن سرویس پاک نمی‌شوند.
+
+### نحوه راه‌اندازی Turso در Render:
+
+1. **ساخت دیتابیس در Turso**:
+   * در [Turso.tech](https://turso.tech) ثبت‌نام کنید.
+   * یک دیتابیس جدید بسازید (مثلاً `luffy-db`).
+   * **Database URL** (که با `libsql://` شروع می‌شود) را کپی کنید.
+   * یک **Auth Token** ایجاد کنید.
+
+2. **تنظیم متغیرهای محیطی در Render**:
+   * در پنل Render به بخش **Environment** بروید.
+   * متغیرهای زیر را اضافه کنید:
+     * `TURSO_DATABASE_URL`: آدرس اتصال به Turso.
+     * `TURSO_AUTH_TOKEN`: توکن احراز هویت Turso.
+
+3. **استقرار مجدد (Redeploy)**:
+   * سرویس را ری‌دیپلوی کنید. پنل به‌طور خودکار جداول را ساخته و شروع به ذخیره‌سازی می‌کند.
+
+> 💡 **نکته:** اگر این متغیرها تنظیم نشوند، پنل از **حافظه (In-memory)** استفاده می‌کند (داده‌ها با ریستارت پاک می‌شوند).
+
 ## ⚙️ متغیرهای محیطی
 
 | متغیر | توضیح | پیش‌فرض |
@@ -493,8 +547,8 @@ vless://<uuid>@<domain>:443?encryption=none&security=tls&type=ws&host=<domain>&p
 
 ## ⚠️ نکات مهم
 
-- تمام داده‌ها **در حافظه** ذخیره می‌شوند. با ریستارت سرویس، همه اینباندها و آمار ترافیک پاک می‌شوند.
-- برای ذخیره‌سازی دائمی، نیاز به اضافه کردن دیتابیس (مثلاً SQLite) وجود دارد.
+- تمام داده‌ها به‌صورت پیش‌فرض **در حافظه** ذخیره می‌شوند. با ریستارت سرویس، همه اینباندها و آمار ترافیک پاک می‌شوند.
+- **ذخیره‌سازی دائمی** از طریق Turso پشتیبانی می‌شود (به بخش دیتابیس در بالا مراجعه کنید).
 - تسک keep-alive هر ۱۰ دقیقه به `/health` پینگ می‌زند تا از خواب رفتن سرویس رایگان Render جلوگیری کند.
 
 
