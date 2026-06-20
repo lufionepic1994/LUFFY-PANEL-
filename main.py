@@ -1,4 +1,4 @@
-Import asyncio
+import asyncio
 import json
 import os
 import hashlib
@@ -16,6 +16,7 @@ import uvicorn
 import httpx
 import logging
 import psutil
+import sqlite3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("Luffy-Gateway")
@@ -25,6 +26,9 @@ app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None)
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
+    "db_path": os.environ.get("DB_PATH", "luffy.db"),
+    "tg_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+    "tg_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
 }
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -48,6 +52,140 @@ CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 UNLIMITED_QUOTA_BYTES = 53687091200000
+
+# ── Persistence (SQLite) ───────────────────────────────────────────────────────
+DB_LOCK = asyncio.Lock()
+
+def _db_conn():
+    conn = sqlite3.connect(CONFIG["db_path"])
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def db_init():
+    conn = _db_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS links (
+        uid TEXT PRIMARY KEY, label TEXT, limit_bytes INTEGER, used_bytes INTEGER,
+        max_connections INTEGER, created_at TEXT, active INTEGER, expires_at TEXT,
+        notified_expiry INTEGER DEFAULT 0, notified_quota INTEGER DEFAULT 0
+    )""")
+    conn.execute("CREATE TABLE IF NOT EXISTS addresses (address TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    conn.close()
+
+def db_load_all():
+    conn = _db_conn()
+    conn.row_factory = sqlite3.Row
+    links = {}
+    for row in conn.execute("SELECT * FROM links"):
+        links[row["uid"]] = {
+            "label": row["label"], "limit_bytes": row["limit_bytes"], "used_bytes": row["used_bytes"],
+            "max_connections": row["max_connections"], "created_at": row["created_at"],
+            "active": bool(row["active"]), "expires_at": row["expires_at"],
+            "notified_expiry": bool(row["notified_expiry"]), "notified_quota": bool(row["notified_quota"]),
+        }
+    addresses = [r["address"] for r in conn.execute("SELECT address FROM addresses")]
+    settings = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
+    conn.close()
+    return links, addresses, settings
+
+async def db_save_link(uid: str, link: dict):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute(
+            """INSERT INTO links (uid,label,limit_bytes,used_bytes,max_connections,created_at,active,expires_at,notified_expiry,notified_quota)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(uid) DO UPDATE SET label=excluded.label, limit_bytes=excluded.limit_bytes,
+               used_bytes=excluded.used_bytes, max_connections=excluded.max_connections,
+               active=excluded.active, expires_at=excluded.expires_at,
+               notified_expiry=excluded.notified_expiry, notified_quota=excluded.notified_quota""",
+            (uid, link["label"], link["limit_bytes"], link["used_bytes"], link.get("max_connections", 0),
+             link["created_at"], int(link["active"]), link.get("expires_at"),
+             int(link.get("notified_expiry", False)), int(link.get("notified_quota", False)))
+        )
+        conn.commit()
+        conn.close()
+
+async def db_delete_link(uid: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("DELETE FROM links WHERE uid=?", (uid,))
+        conn.commit()
+        conn.close()
+
+async def db_save_address(address: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("INSERT OR IGNORE INTO addresses (address) VALUES (?)", (address,))
+        conn.commit()
+        conn.close()
+
+async def db_delete_address(address: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("DELETE FROM addresses WHERE address=?", (address,))
+        conn.commit()
+        conn.close()
+
+async def db_save_setting(key: str, value: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        conn.commit()
+        conn.close()
+
+async def flush_usage_to_db():
+    """Periodically persist in-memory traffic counters so restarts don't lose usage data."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            async with LINKS_LOCK:
+                snapshot = {uid: dict(data) for uid, data in LINKS.items()}
+            for uid, data in snapshot.items():
+                await db_save_link(uid, data)
+        except Exception:
+            logger.exception("usage flush failed")
+
+# ── Telegram notifications ─────────────────────────────────────────────────────
+async def telegram_notify(text: str):
+    token, chat_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
+    if not token or not chat_id:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+            )
+    except Exception:
+        pass
+
+async def quota_expiry_watcher():
+    """Checks every 5 minutes for links nearing quota/expiry and sends a one-time Telegram alert."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            async with LINKS_LOCK:
+                items = list(LINKS.items())
+            for uid, link in items:
+                changed = False
+                if link["limit_bytes"] > 0:
+                    pct = link["used_bytes"] / link["limit_bytes"] * 100
+                    if pct >= 90 and not link.get("notified_quota"):
+                        await telegram_notify(f"⚠️ <b>{link['label']}</b> reached {pct:.0f}% of its data quota.")
+                        link["notified_quota"] = True
+                        changed = True
+                exp = parse_expires_at(link.get("expires_at"))
+                if exp is not None:
+                    remaining = (exp - datetime.now(timezone.utc)).total_seconds()
+                    if 0 < remaining <= 86400 and not link.get("notified_expiry"):
+                        await telegram_notify(f"⏳ <b>{link['label']}</b> expires in less than 24 hours.")
+                        link["notified_expiry"] = True
+                        changed = True
+                if changed:
+                    await db_save_link(uid, link)
+        except Exception:
+            logger.exception("quota/expiry watcher failed")
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 def hash_password(pw: str) -> str:
@@ -102,7 +240,24 @@ async def startup():
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
+
+    db_init()
+    saved_links, saved_addresses, saved_settings = db_load_all()
+    if saved_links:
+        async with LINKS_LOCK:
+            LINKS.update(saved_links)
+    if saved_addresses:
+        async with CUSTOM_ADDRESSES_LOCK:
+            CUSTOM_ADDRESSES.clear()
+            CUSTOM_ADDRESSES.extend(saved_addresses)
+    if "password_hash" in saved_settings:
+        AUTH["password_hash"] = saved_settings["password_hash"]
+    elif os.environ.get("ADMIN_PASSWORD"):
+        await db_save_setting("password_hash", AUTH["password_hash"])
+
     asyncio.create_task(keep_alive())
+    asyncio.create_task(flush_usage_to_db())
+    asyncio.create_task(quota_expiry_watcher())
     await ensure_default_link()
 
 @app.on_event("shutdown")
@@ -169,6 +324,7 @@ def seconds_until_expiry(expires_at_str: str | None) -> int | None:
     return max(0, int(remaining))
 
 async def ensure_default_link():
+    created = False
     async with LINKS_LOCK:
         if not LINKS:
             LINKS["Default"] = {
@@ -180,6 +336,9 @@ async def ensure_default_link():
                 "active": True,
                 "expires_at": None,
             }
+            created = True
+    if created:
+        await db_save_link("Default", LINKS["Default"])
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
@@ -262,6 +421,7 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     if len(new) < 4:
         raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
     AUTH["password_hash"] = hash_password(new)
+    await db_save_setting("password_hash", AUTH["password_hash"])
     current_token = request.cookies.get(SESSION_COOKIE)
     async with SESSIONS_LOCK:
         SESSIONS.clear()
@@ -325,11 +485,58 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "active": True,
             "expires_at": expires_at,
         }
+    await db_save_link(uid, LINKS[uid])
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
         "expires_at": expires_at, "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}"),
     }
+
+@app.post("/api/links/bulk")
+async def create_links_bulk(request: Request, _=Depends(require_auth)):
+    """Create multiple inbounds at once, e.g. {"prefix": "User", "count": 10, "limit_value": 10,
+    "limit_unit": "GB", "max_connections": 2, "days_valid": 30}"""
+    body = await request.json()
+    prefix = (body.get("prefix") or "User").strip()[:40]
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', prefix):
+        raise HTTPException(status_code=400, detail="Prefix must contain only English letters, numbers, and characters: - _ . space")
+    count = int(body.get("count") or 0)
+    if count <= 0 or count > 200:
+        raise HTTPException(status_code=400, detail="Count must be between 1 and 200")
+    limit_value = float(body.get("limit_value") or 0)
+    limit_unit = body.get("limit_unit") or "GB"
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    max_conn = int(body.get("max_connections") or 0)
+    if max_conn < 0:
+        max_conn = 0
+    days_valid = body.get("days_valid")
+    expires_at: str | None = None
+    if days_valid is not None:
+        try:
+            days_valid = int(days_valid)
+            if days_valid > 0:
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
+        except (ValueError, TypeError):
+            pass
+
+    created = []
+    async with LINKS_LOCK:
+        existing_max = 0
+        for k in LINKS:
+            m = re.match(rf'^{re.escape(prefix)}-(\d+)$', k)
+            if m:
+                existing_max = max(existing_max, int(m.group(1)))
+        for i in range(1, count + 1):
+            uid = f"{prefix}-{existing_max + i}"
+            LINKS[uid] = {
+                "label": uid, "limit_bytes": limit_bytes, "used_bytes": 0,
+                "max_connections": max_conn, "created_at": datetime.now(timezone.utc).isoformat(),
+                "active": True, "expires_at": expires_at,
+            }
+            created.append(uid)
+    for uid in created:
+        await db_save_link(uid, LINKS[uid])
+    return {"ok": True, "created": created, "count": len(created)}
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
@@ -366,6 +573,7 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             LINKS[uid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
         if "reset_usage" in body and body["reset_usage"]:
             LINKS[uid]["used_bytes"] = 0
+            LINKS[uid]["notified_quota"] = False
         if "label" in body:
             LINKS[uid]["label"] = str(body["label"])[:60]
         if "max_connections" in body:
@@ -376,10 +584,13 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
                 dv = int(body["days_valid"])
                 if dv > 0:
                     LINKS[uid]["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=dv)).isoformat()
+                    LINKS[uid]["notified_expiry"] = False
                 else:
                     LINKS[uid]["expires_at"] = None
             except (ValueError, TypeError):
                 pass
+        link_copy = dict(LINKS[uid])
+    await db_save_link(uid, link_copy)
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
@@ -387,6 +598,7 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         LINKS.pop(uid, None)
     await close_connections_for_link(uid)
+    await db_delete_link(uid)
     return {"ok": True}
 
 @app.get("/api/addresses")
@@ -406,16 +618,80 @@ async def add_address(request: Request, _=Depends(require_auth)):
         if address in CUSTOM_ADDRESSES:
             raise HTTPException(status_code=400, detail="Address already exists")
         CUSTOM_ADDRESSES.append(address)
+    await db_save_address(address)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
     async with CUSTOM_ADDRESSES_LOCK:
         if 0 <= index < len(CUSTOM_ADDRESSES):
-            CUSTOM_ADDRESSES.pop(index)
+            removed = CUSTOM_ADDRESSES.pop(index)
         else:
             raise HTTPException(status_code=404, detail="Address not found")
+    await db_delete_address(removed)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
+
+@app.get("/api/backup")
+async def export_backup(_=Depends(require_auth)):
+    """Full JSON export of inbounds + addresses, downloadable for safekeeping."""
+    async with LINKS_LOCK:
+        links_snapshot = {uid: dict(data) for uid, data in LINKS.items()}
+    async with CUSTOM_ADDRESSES_LOCK:
+        addresses_snapshot = list(CUSTOM_ADDRESSES)
+    payload = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "links": links_snapshot,
+        "addresses": addresses_snapshot,
+    }
+    headers = {"Content-Disposition": f'attachment; filename="luffy-backup-{int(time.time())}.json"'}
+    return JSONResponse(content=payload, headers=headers)
+
+@app.post("/api/restore")
+async def restore_backup(request: Request, _=Depends(require_auth)):
+    """Restore inbounds + addresses from a previously exported backup JSON. Replaces current data."""
+    body = await request.json()
+    links_in = body.get("links")
+    addresses_in = body.get("addresses")
+    if not isinstance(links_in, dict):
+        raise HTTPException(status_code=400, detail="Invalid backup file: missing 'links'")
+    restored = 0
+    async with LINKS_LOCK:
+        LINKS.clear()
+        for uid, data in links_in.items():
+            try:
+                LINKS[uid] = {
+                    "label": str(data.get("label", uid))[:60],
+                    "limit_bytes": int(data.get("limit_bytes", 0)),
+                    "used_bytes": int(data.get("used_bytes", 0)),
+                    "max_connections": int(data.get("max_connections", 0)),
+                    "created_at": data.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                    "active": bool(data.get("active", True)),
+                    "expires_at": data.get("expires_at"),
+                    "notified_expiry": bool(data.get("notified_expiry", False)),
+                    "notified_quota": bool(data.get("notified_quota", False)),
+                }
+                restored += 1
+            except Exception:
+                continue
+        links_snapshot = {uid: dict(d) for uid, d in LINKS.items()}
+    if isinstance(addresses_in, list):
+        async with CUSTOM_ADDRESSES_LOCK:
+            CUSTOM_ADDRESSES.clear()
+            CUSTOM_ADDRESSES.extend(str(a) for a in addresses_in)
+        async with DB_LOCK:
+            conn = _db_conn()
+            conn.execute("DELETE FROM addresses")
+            conn.executemany("INSERT OR IGNORE INTO addresses (address) VALUES (?)", [(a,) for a in CUSTOM_ADDRESSES])
+            conn.commit()
+            conn.close()
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("DELETE FROM links")
+        conn.commit()
+        conn.close()
+    for uid, data in links_snapshot.items():
+        await db_save_link(uid, data)
+    return {"ok": True, "restored_links": restored, "restored_addresses": len(CUSTOM_ADDRESSES)}
 
 @app.get("/api/links/{uid}/sub")
 async def get_subscription(uid: str, _=Depends(require_auth)):
@@ -1079,6 +1355,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
           <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
           <div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div>
         </div>
+        <button class="btn btn-ghost" onclick="showBulkMo()" data-en="⚡ Bulk Create" data-fa="⚡ ساخت گروهی">⚡ Bulk Create</button>
         <button class="btn btn-gold" onclick="showAddMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
       </div>
       <div class="tb">
@@ -1143,6 +1420,13 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw" data-ph-en="Min 4 chars" data-ph-fa="حداقل ۴ کاراکتر" placeholder="Min 4 chars"></div>
         <button class="btn btn-gold" onclick="chgPw()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
       </div>
+      <div class="card" style="max-width:380px">
+        <div class="card-hd"><div class="card-title" data-en="Backup &amp; Restore" data-fa="پشتیبان‌گیری و بازیابی">Backup &amp; Restore</div></div>
+        <div style="font-size:11.5px;color:var(--text3);margin-bottom:12px" data-en="Inbound data is stored on disk, but exporting a backup protects you against accidental loss." data-fa="اطلاعات اینباندها روی دیسک ذخیره می‌شود، اما گرفتن بک‌آپ شما را در برابر از دست رفتن تصادفی داده محافظت می‌کند.">Inbound data is stored on disk, but exporting a backup protects you against accidental loss.</div>
+        <button class="btn btn-ghost" onclick="downloadBackup()" style="width:100%;justify-content:center;margin-bottom:8px;" data-en="⬇ Export Backup" data-fa="⬇ خروجی بک‌آپ">⬇ Export Backup</button>
+        <input type="file" id="restore-file" accept="application/json" style="display:none" onchange="restoreBackup(this.files[0])">
+        <button class="btn btn-ghost" onclick="document.getElementById('restore-file').click()" style="width:100%;justify-content:center;" data-en="⬆ Restore From File" data-fa="⬆ بازیابی از فایل">⬆ Restore From File</button>
+      </div>
     </section>
 
   </main>
@@ -1161,6 +1445,24 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
     <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
+  </div>
+</div>
+
+<div class="mo" id="mo-bulk" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box">
+    <button class="mo-close" onclick="document.getElementById('mo-bulk').classList.remove('show')">✕</button>
+    <div class="mo-title" data-en="BULK CREATE" data-fa="ساخت گروهی">BULK CREATE</div>
+    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Name Prefix" data-fa="پیشوند نام">Name Prefix</label><input class="fi" id="bp" data-ph-en="e.g. User" data-ph-fa="مثلاً کاربر" placeholder="e.g. User" value="User"></div>
+      <div class="fg" style="max-width:90px"><label class="fl" data-en="Count" data-fa="تعداد">Count</label><input class="fi" id="bn" type="number" min="1" max="200" value="5"></div>
+    </div>
+    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="bv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="bu"><option>GB</option></select></div>
+    </div>
+    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="bc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="bd" type="number" min="0" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
+    <button class="btn btn-gold" onclick="bulkCreate()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE ALL" data-fa="ایجاد همه">CREATE ALL</button>
   </div>
 </div>
 
@@ -1403,7 +1705,7 @@ function renderLinks(links){
   const qrText=tr('qr');
   const delText=tr('del');
 
-  tb.innerHTML=rows.map(r=><tr>
+  tb.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
     <td style="font-weight:600">${esc(r.l.label)}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
@@ -1419,9 +1721,9 @@ function renderLinks(links){
       <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div></td>
-  </tr>).join('');
+  </tr>`).join('');
 
-  mc.innerHTML=rows.map(r=><div class="m-card">
+  mc.innerHTML=rows.map(r=>`<div class="m-card">
     <div class="m-card-hd">
       <div style="display:flex;align-items:center;gap:7px">
         <span style="font-size:11px;color:var(--text3)">#${r.i}</span>
@@ -1439,7 +1741,7 @@ function renderLinks(links){
       <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div>
-  </div>).join('');
+  </div>`).join('');
 }
 
 async function togLink(el){
@@ -1499,7 +1801,66 @@ async function createLink(){
   }catch(e){toast('Error creating link',true);}
 }
 
-function showEditMo(uid){
+function showBulkMo(){$m('mo-bulk').classList.add('show');}
+
+async function bulkCreate(){
+  const prefix=$m('bp').value.trim()||'User';
+  if(!/^[a-zA-Z0-9\-_. ]+$/.test(prefix)){toast('Only English letters allowed',true);return;}
+  const count=parseInt($m('bn').value)||0;
+  if(count<1||count>200){toast('Count must be 1-200',true);return;}
+  const v=parseFloat($m('bv').value)||0;
+  const mc=parseInt($m('bc').value)||0;
+  const days=parseInt($m('bd').value)||0;
+  try{
+    const r=await fetch('/api/links/bulk',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prefix,count,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
+    });
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Error');}
+    const d=await r.json();
+    toast('Created '+d.count+' inbounds');
+    $m('bn').value='5';$m('bv').value='';$m('bc').value='';$m('bd').value='';
+    $m('mo-bulk').classList.remove('show');
+    await loadLinks();
+    await loadStats();
+  }catch(e){toast(e.message||'Error bulk creating',true);}
+}
+
+async function downloadBackup(){
+  try{
+    const r=await fetch('/api/backup');
+    if(!r.ok)throw new Error();
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='luffy-backup-'+Date.now()+'.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('Backup exported');
+  }catch(e){toast('Error exporting backup',true);}
+}
+
+async function restoreBackup(file){
+  if(!file)return;
+  if(!confirm('This will replace all current inbounds and addresses. Continue?'))return;
+  try{
+    const text=await file.text();
+    const data=JSON.parse(text);
+    const r=await fetch('/api/restore',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(data)
+    });
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Error');}
+    const d=await r.json();
+    toast('Restored '+d.restored_links+' inbounds');
+    await loadLinks();
+    await loadAddrs();
+    await loadStats();
+  }catch(e){toast(e.message||'Invalid backup file',true);}
+  $m('restore-file').value='';
+}
   const l=allLinks.find(x=>x.uuid===uid);
   if(!l)return;
   $m('eu').value=uid;
@@ -1708,13 +2069,13 @@ function renderAddrs(){
     el.innerHTML='<div style="color:var(--text3);font-size:12px">No addresses added</div>';
     return;
   }
-  el.innerHTML=allAddrs.map((a,i)=><div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
+  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
     <div style="display:flex;align-items:center;gap:10px">
       <span style="color:var(--gold);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
     <button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button>
-  </div>).join('');
+  </div>`).join('');
 }
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
@@ -1778,5 +2139,5 @@ async def dashboard_page(request: Request):
 async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
-if name == "main":
+if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
